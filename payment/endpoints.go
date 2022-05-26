@@ -1,10 +1,17 @@
 package payment
 
 import (
+	"fmt"
+
 	"github.com/go-kit/kit/endpoint"
-	"github.com/go-kit/kit/tracing/opentracing"
-	stdopentracing "github.com/opentracing/opentracing-go"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/net/context"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"go.opentelemetry.io/contrib/instrumentation/github.com/go-kit/kit/otelkit"
 )
 
 // Endpoints collects the endpoints that comprise the Service.
@@ -13,24 +20,30 @@ type Endpoints struct {
 	HealthEndpoint    endpoint.Endpoint
 }
 
+var tracer = otel.Tracer("payment")
+
 // MakeEndpoints returns an Endpoints structure, where each endpoint is
 // backed by the given service.
-func MakeEndpoints(s Service, tracer stdopentracing.Tracer) Endpoints {
+func MakeEndpoints(s Service) Endpoints {
 	return Endpoints{
-		AuthoriseEndpoint: opentracing.TraceServer(tracer, "POST /paymentAuth")(MakeAuthoriseEndpoint(s)),
-		HealthEndpoint:    opentracing.TraceServer(tracer, "GET /health")(MakeHealthEndpoint(s)),
+		AuthoriseEndpoint: otelkit.EndpointMiddleware(otelkit.WithOperation("authorize payment"),)(MakeAuthoriseEndpoint(s)),
+		HealthEndpoint:    otelkit.EndpointMiddleware(otelkit.WithOperation("health check"),)(MakeHealthEndpoint(s)),
 	}
 }
 
 // MakeListEndpoint returns an endpoint via the given service.
 func MakeAuthoriseEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "authorize payment")
-		span.SetTag("service", "payment")
-		defer span.Finish()
+		span := oteltrace.SpanFromContext(ctx)
+		//defer span.End()
 		req := request.(AuthoriseRequest)
-		authorisation, err := s.Authorise(req.Amount)
+		span.SetAttributes(attribute.String("amount", fmt.Sprintf("%.2f", req.Amount)),attribute.String("service", "payment"))
+		authorisation, err := s.Authorise(req.Amount, span.SpanContext().TraceID().String(),span.SpanContext().SpanID().String())
+		if (err == ErrGatewayUnavailable) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "payment gateway error")
+		}
+
 		return AuthoriseResponse{Authorisation: authorisation, Err: err}, nil
 	}
 }
@@ -38,10 +51,9 @@ func MakeAuthoriseEndpoint(s Service) endpoint.Endpoint {
 // MakeHealthEndpoint returns current health of the given service.
 func MakeHealthEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "health check")
-		span.SetTag("service", "payment")
-		defer span.Finish()
+		span := oteltrace.SpanFromContext(ctx)
+		span.SetAttributes(attribute.String("service", "payment"))
+		//defer span.End()
 		health := s.Health()
 		return healthResponse{Health: health}, nil
 	}
@@ -57,6 +69,7 @@ type AuthoriseRequest struct {
 type AuthoriseResponse struct {
 	Authorisation Authorisation
 	Err           error
+	TraceID oteltrace.TraceID
 }
 
 type healthRequest struct {

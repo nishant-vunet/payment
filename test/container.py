@@ -11,8 +11,6 @@ from util.Dredd import Dredd
 
 class PaymentContainerTest(unittest.TestCase):
     TAG = "latest"
-    PORT = "8080"
-
     container_name = Docker().random_container_name('payment')
 
     def __init__(self, methodName='runTest'):
@@ -24,8 +22,7 @@ class PaymentContainerTest(unittest.TestCase):
                    '-d',
                    '--name', PaymentContainerTest.container_name,
                    '-h', 'payment',
-                   'weaveworksdemos/payment-dev:' + self.TAG,
-                   '/app', '-port=' + PaymentContainerTest.PORT]
+                   'weaveworksdemos/payment-dev:' + self.TAG]
         Docker().execute(command)
         self.ip = Docker().get_container_ip(PaymentContainerTest.container_name)
 
@@ -34,16 +31,14 @@ class PaymentContainerTest(unittest.TestCase):
 
     def test_api_validated(self):
         limit = 30
-        url = f'http://{self.ip}:{PaymentContainerTest.PORT}/'
-        
-        while Api().noResponse(url + 'payments/'):
+        while Api().noResponse('http://' + self.ip + ':80/payments/'):
             if limit == 0:
                 self.fail("Couldn't get the API running")
             limit = limit - 1
             sleep(1)
         
         out = Dredd().test_against_endpoint("payment",
-                                            url,
+                                            'http://' + self.ip + ':80/',
                                             links=[self.container_name],
                                             dump_streams=True)
         

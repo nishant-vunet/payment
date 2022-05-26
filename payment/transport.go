@@ -9,37 +9,33 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/circuitbreaker"
-	"github.com/go-kit/kit/tracing/opentracing"
 	httptransport "github.com/go-kit/kit/transport/http"
 	"github.com/gorilla/mux"
-	stdopentracing "github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
         "github.com/streadway/handy/breaker"
 	"golang.org/x/net/context"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	
 )
 
 // MakeHTTPHandler mounts the endpoints into a REST-y HTTP handler.
-func MakeHTTPHandler(ctx context.Context, e Endpoints, logger log.Logger, tracer stdopentracing.Tracer) *mux.Router {
+func MakeHTTPHandler(ctx context.Context, e Endpoints, logger log.Logger) *mux.Router {
 	r := mux.NewRouter().StrictSlash(false)
 	options := []httptransport.ServerOption{
 		httptransport.ServerErrorLogger(logger),
 		httptransport.ServerErrorEncoder(encodeError),
 	}
 
-	r.Methods("POST").Path("/paymentAuth").Handler(httptransport.NewServer(
-		ctx,
+	r.Methods("POST").Path("/paymentAuth").Handler(otelhttp.WithRouteTag("/paymentAuth", httptransport.NewServer(
 		circuitbreaker.HandyBreaker(breaker.NewBreaker(0.2))(e.AuthoriseEndpoint),
 		decodeAuthoriseRequest,
 		encodeAuthoriseResponse,
-		append(options, httptransport.ServerBefore(opentracing.FromHTTPRequest(tracer, "POST /paymentAuth", logger)))...,
-	))
-	r.Methods("GET").Path("/health").Handler(httptransport.NewServer(
-		ctx,
+		options...)))
+	r.Methods("GET").Path("/health").Handler(otelhttp.WithRouteTag("/health", httptransport.NewServer(
 		circuitbreaker.HandyBreaker(breaker.NewBreaker(0.2))(e.HealthEndpoint),
 		decodeHealthRequest,
 		encodeHealthResponse,
-		append(options, httptransport.ServerBefore(opentracing.FromHTTPRequest(tracer, "GET /health", logger)))...,
-	))
+		options...)))
 	r.Handle("/metrics", promhttp.Handler())
 	return r
 }
@@ -65,6 +61,7 @@ func decodeAuthoriseRequest(_ context.Context, r *http.Request) (interface{}, er
 			return nil, err
 		}
 	}
+
 	// Save the content
 	bodyString := string(bodyBytes)
 

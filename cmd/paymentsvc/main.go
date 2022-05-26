@@ -3,18 +3,30 @@ package main
 import (
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-kit/kit/log"
-	"github.com/microservices-demo/payment"
-	stdopentracing "github.com/opentracing/opentracing-go"
-	zipkin "github.com/openzipkin/zipkin-go-opentracing"
+	"github.com/go-kit/kit/log/level"
 	"golang.org/x/net/context"
+
+//	"google.golang.org/grpc"
+
+	"github.com/microservices-demo/payment/payment"
+
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
 )
 
 const (
@@ -23,63 +35,107 @@ const (
 
 func main() {
 	var (
-		port          = flag.String("port", "8080", "Port to bind HTTP listener")
-		zip           = flag.String("zipkin", os.Getenv("ZIPKIN"), "Zipkin address")
-		declineAmount = flag.Float64("decline", 105, "Decline payments over certain amount")
+		port          = flag.String("port", "80", "Port to bind HTTP listener")
+		otelurl       = flag.String("otel", os.Getenv("OTEL"), "OTLP address")
+		declineAmount = flag.Float64("decline", 100, "Decline payments over certain amount")
 	)
 	flag.Parse()
-	var tracer stdopentracing.Tracer
+
+	// Log domain.
+	var logger log.Logger
+	ctx := context.Background()
 	{
-		// Log domain.
-		var logger log.Logger
-		{
-			logger = log.NewLogfmtLogger(os.Stderr)
-			logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC)
-			logger = log.NewContext(logger).With("caller", log.DefaultCaller)
-		}
-		// Find service local IP.
-		conn, err := net.Dial("udp", "8.8.8.8:80")
+		logger = log.NewLogfmtLogger(os.Stderr)
+		logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller")
+	}
+
+	//var bsp sdktrace.SpanProcessor
+
+	if *otelurl == "" {
+		traceExporter, err := stdouttrace.New(
+			stdouttrace.WithPrettyPrint(),
+		)
 		if err != nil {
-			logger.Log("err", err)
+			level.Error(logger).Log("failed to initialize stdouttrace export pipeline: %v", err)
 			os.Exit(1)
 		}
-		localAddr := conn.LocalAddr().(*net.UDPAddr)
-		host := strings.Split(localAddr.String(), ":")[0]
-		defer conn.Close()
-		if *zip == "" {
-			tracer = stdopentracing.NoopTracer{}
-		} else {
-			logger := log.NewContext(logger).With("tracer", "Zipkin")
-			logger.Log("addr", zip)
-			collector, err := zipkin.NewHTTPCollector(
-				*zip,
-				zipkin.HTTPLogger(logger),
-			)
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
-			tracer, err = zipkin.NewTracer(
-				zipkin.NewRecorder(collector, false, fmt.Sprintf("%v:%v", host, port), ServiceName),
-			)
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
-		}
-		stdopentracing.InitGlobalTracer(tracer)
+		bsp := sdktrace.NewBatchSpanProcessor(traceExporter)
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(bsp))
+		otel.SetTracerProvider(tp)
+	} else {
+		//logger := log.NewContext(logger).With("tracer", "Otel")
+	//	otelurlValue := *otelurl
+		level.Info(logger).Log("addr", otelurl)
 
+		ctx := context.Background()
+/*		traceExporter, err := otlptracegrpc.New(ctx,
+			otlptracegrpc.WithEndpoint(otelurlValue),
+			otlptracegrpc.WithInsecure(),
+			otlptracegrpc.WithDialOption(grpc.WithBlock()),
+		)*/
+	        traceExporter, err := otlptracegrpc.New(ctx)
+		if err != nil {
+			//log.Fatal(err)
+			level.Error(logger).Log("failed to initialize OTLP grpc exporter: %v", err)
+		}
+		/*tp := sdktrace.NewTracerProvider(
+			sdktrace.WithSampler(sdktrace.AlwaysSample()),
+                        sdktrace.WithBatcher(traceExporter),
+		)
+		otel.SetTracerProvider(tp)
+	        otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+		*/
+		if err != nil {
+			level.Error(logger).Log("Failed to create the collector exporter: %v", err)
+			os.Exit(1)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			if err := traceExporter.Shutdown(ctx); err != nil {
+				otel.Handle(err)
+			}
+		}()
+
+		res, err := resource.New(ctx,
+			resource.WithAttributes(
+				// the service name used to display traces in backends
+				semconv.ServiceNameKey.String("payment"),
+			),
+		)
+
+		tp := sdktrace.NewTracerProvider(
+			sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			sdktrace.WithResource(res),
+			sdktrace.WithBatcher(
+				traceExporter,
+				// add following two options to ensure flush
+				sdktrace.WithBatchTimeout(5*time.Second),
+				sdktrace.WithMaxExportBatchSize(10),
+			),
+		)
+		defer func() {
+			ctx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			if err := tp.Shutdown(ctx); err != nil {
+				otel.Handle(err)
+			}
+		}()
+		otel.SetTracerProvider(tp)
+		propagator := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
+		otel.SetTextMapPropagator(propagator)
 	}
 	// Mechanical stuff.
 	errc := make(chan error)
-	ctx := context.Background()
 
-	handler, logger := payment.WireUp(ctx, float32(*declineAmount), tracer, ServiceName)
+	handler, logger := payment.WireUp(ctx, float32(*declineAmount), ServiceName)
 
 	// Create and launch the HTTP server.
 	go func() {
 		logger.Log("transport", "HTTP", "port", *port)
-		errc <- http.ListenAndServe(":"+*port, handler)
+		errc <- http.ListenAndServe(":"+*port, otelhttp.NewHandler(handler, "payment",
+			otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	))
 	}()
 
 	// Capture interrupts.
